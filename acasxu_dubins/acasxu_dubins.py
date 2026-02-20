@@ -513,7 +513,7 @@ class State():
         # max inputs: 60760, 3.1415, 3,1415, 1200, 1200
 
         if rho > 60760:
-            self.command = 0
+            new_command = 0
         else:
             last_command = self.command
 
@@ -522,7 +522,11 @@ class State():
             state = [rho, theta, psi, v_own, v_int]
 
             res = run_network(net, state)
-            self.command = np.argmin(res)
+            new_command = np.argmin(res)
+
+        # Only issue an advisory update when the advisory actually changes.
+        if new_command != self.command:
+            self.command = new_command
 
             #names = ['clear-of-conflict', 'weak-left', 'weak-right', 'strong-left', 'strong-right']
 
