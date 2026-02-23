@@ -209,6 +209,7 @@ class State():
     nn_update_rate = 1.0 # todo: make this a parameter
     dt = 1.0
     min_dwell_time = 0.0
+    q_hysteresis_margin = 0.0
 
     'Valid range" [100, 1145]'
     #v_own = 800 # ft/sec
@@ -242,6 +243,16 @@ class State():
         self.u_list = []
         self.u_list_index = None
         self.min_dist = np.inf
+        self.min_dist_time = None
+        self.first_alert_time = None
+        self.first_alert_range = None
+        self.alert_active_time = 0.0
+        self.alert_episode_count = 0
+        self.in_alert_episode = False
+        self.advisory_change_count = 0
+        self.reversal_count = 0
+        self.last_non_coc_direction = 0
+        self.sim_metrics = {}
 
     def __str__(self):
         x1, y1, _theta1, x2, y2, _theta2, _ = self.vec
@@ -449,6 +460,21 @@ class State():
             self.commands.append(self.command)
             self.int_commands.append(intruder_cmd)
 
+        rho_now = math.sqrt((self.vec[0] - self.vec[3])**2 + (self.vec[1] - self.vec[4])**2)
+
+        if self.command != 0:
+            if self.first_alert_time is None:
+                self.first_alert_time = self.vec[-1]
+                self.first_alert_range = rho_now
+
+            self.alert_active_time += State.dt
+
+            if not self.in_alert_episode:
+                self.in_alert_episode = True
+                self.alert_episode_count += 1
+        elif self.in_alert_episode:
+            self.in_alert_episode = False
+
         time_elapse_mat = State.time_elapse_mats[self.command][intruder_cmd] #get_time_elapse_mat(self.command, State.dt, intruder_cmd)
 
         self.vec = step_state(self.vec, self.v_own, self.v_int, time_elapse_mat, State.dt)
@@ -462,6 +488,17 @@ class State():
 
         self.u_list = cmd_list
         self.u_list_index = None
+        self.min_dist = np.inf
+        self.min_dist_time = None
+        self.first_alert_time = None
+        self.first_alert_range = None
+        self.alert_active_time = 0.0
+        self.alert_episode_count = 0
+        self.in_alert_episode = False
+        self.advisory_change_count = 0
+        self.reversal_count = 0
+        self.last_non_coc_direction = 0
+        self.sim_metrics = {}
 
         assert isinstance(cmd_list, list)
         tmax = len(cmd_list) * State.nn_update_rate
@@ -473,11 +510,16 @@ class State():
 
         #self.min_dist = 0, math.sqrt((self.vec[0] - self.vec[3])**2 + (self.vec[1] - self.vec[4])**2), self.vec.copy()
         prev_dist_sq = (self.vec[0] - self.vec[3])**2 + (self.vec[1] - self.vec[4])**2
+        min_dist_sq = prev_dist_sq
+        min_dist_time = self.vec[-1]
 
         while t + 1e-6 < tmax:
             self.step()
 
             cur_dist_sq = (self.vec[0] - self.vec[3])**2 + (self.vec[1] - self.vec[4])**2
+            if cur_dist_sq < min_dist_sq:
+                min_dist_sq = cur_dist_sq
+                min_dist_time = self.vec[-1]
 
             if self.save_states:
                 rv.append(self.vec.copy())
@@ -490,7 +532,23 @@ class State():
 
             prev_dist_sq = cur_dist_sq
 
-        self.min_dist = math.sqrt(prev_dist_sq)
+        self.min_dist = math.sqrt(min_dist_sq)
+        self.min_dist_time = min_dist_time
+        alert_lead_time = None
+        if self.first_alert_time is not None:
+            alert_lead_time = self.min_dist_time - self.first_alert_time
+
+        self.sim_metrics = {
+            'min_dist': self.min_dist,
+            'min_dist_time': self.min_dist_time,
+            'first_alert_time': self.first_alert_time,
+            'first_alert_range': self.first_alert_range,
+            'alert_lead_time_to_cpa': alert_lead_time,
+            'alert_active_time': self.alert_active_time,
+            'alert_episode_count': self.alert_episode_count,
+            'advisory_change_count': self.advisory_change_count,
+            'reversal_count': self.reversal_count,
+        }
 
         if self.save_states:
             self.vec_list = rv
@@ -516,6 +574,7 @@ class State():
 
         if rho > 60760:
             new_command = 0
+            hysteresis_ok = True
         else:
             last_command = self.command
 
@@ -526,13 +585,31 @@ class State():
             res = run_network(net, state)
             new_command = np.argmin(res)
 
+            hysteresis_ok = True
+            if new_command != self.command and State.q_hysteresis_margin > 0.0:
+                proposed_q = float(res[new_command])
+                current_q = float(res[self.command])
+                hysteresis_ok = (current_q - proposed_q) >= State.q_hysteresis_margin
+
         advisory_age = self.vec[-1] - self.last_advisory_change_time
 
-        # Only issue an advisory update when the advisory changes and has satisfied minimum dwell time.
+        # Only issue an advisory update when all stability constraints are satisfied.
         if new_command != self.command:
-            if advisory_age + 1e-9 >= State.min_dwell_time:
+            if hysteresis_ok and advisory_age + 1e-9 >= State.min_dwell_time:
+                old_command = self.command
                 self.command = new_command
                 self.last_advisory_change_time = self.vec[-1]
+                self.advisory_change_count += 1
+
+                new_dir = State.get_advisory_direction(new_command)
+                if new_dir != 0:
+                    if self.last_non_coc_direction != 0 and new_dir != self.last_non_coc_direction:
+                        self.reversal_count += 1
+
+                    self.last_non_coc_direction = new_dir
+
+                if old_command != 0 and new_command == 0 and self.in_alert_episode:
+                    self.in_alert_episode = False
 
             #names = ['clear-of-conflict', 'weak-left', 'weak-right', 'strong-left', 'strong-right']
 
@@ -543,6 +620,79 @@ class State():
 
             # repeat last command if no more commands
             self.u_list_index = min(self.u_list_index, len(self.u_list) - 1)
+
+    @staticmethod
+    def get_advisory_direction(cmd):
+        """map command to turn direction: left=-1, none=0, right=1"""
+
+        if cmd in (1, 3):
+            return -1
+
+        if cmd in (2, 4):
+            return 1
+
+        return 0
+
+def summarize_performance(metrics, num_sims, total_runtime, false_alert_distance, nuisance_max_alert_time, nmac_distance):
+    """print aggregate metrics for a sweep of simulations"""
+
+    alerts = metrics['alerts']
+    first_alert_ranges = np.array(metrics['first_alert_ranges'], dtype=float)
+    lead_times = np.array(metrics['alert_lead_times'], dtype=float)
+    min_dists = np.array(metrics['min_dists'], dtype=float)
+    false_alerts = metrics['false_alerts']
+    nuisance_alerts = metrics['nuisance_alerts']
+    nmac_count = metrics['nmac_count']
+    reversals = metrics['reversal_sims']
+    advisory_changes = metrics['total_advisory_changes']
+
+    sims_per_sec = num_sims / total_runtime if total_runtime > 0 else np.inf
+    ms_per_sim = 1000.0 * total_runtime / num_sims if num_sims > 0 else np.inf
+
+    print("\nPerformance metrics summary")
+    print(f"  simulations: {num_sims}")
+    if 'initial_turning_count' in metrics and 'initial_coc_count' in metrics:
+        turning_count = metrics['initial_turning_count']
+        coc_count = metrics['initial_coc_count']
+        print(
+            f"  initial advisory mix: turning={turning_count}/{num_sims} ({100.0 * turning_count / num_sims:.1f}%), "
+            f"COC={coc_count}/{num_sims} ({100.0 * coc_count / num_sims:.1f}%)"
+        )
+    print(f"  runtime: {total_runtime:.3f}s total ({ms_per_sim:.3f} ms/sim, {sims_per_sec:.1f} sim/s)")
+
+    print("  Detection and alerting range:")
+    if alerts > 0:
+        print(f"    alert rate: {alerts}/{num_sims} ({100.0 * alerts / num_sims:.2f}%)")
+        print(f"    first alert range mean: {np.mean(first_alert_ranges):.1f} ft")
+        print(f"    first alert range median: {np.median(first_alert_ranges):.1f} ft")
+    else:
+        print("    no alerts issued")
+
+    print("  Alert timing relative to closest point of approach:")
+    if lead_times.size > 0:
+        print(f"    lead time mean (CPA - first alert): {np.mean(lead_times):.2f} s")
+        print(f"    lead time median (CPA - first alert): {np.median(lead_times):.2f} s")
+        late_count = int(np.sum(lead_times < 0))
+        print(f"    late alerts (after CPA): {late_count}/{lead_times.size}")
+    else:
+        print("    no alert timing samples")
+
+    print("  False alert and nuisance alert rate:")
+    print(f"    false alert distance threshold: {false_alert_distance:.1f} ft")
+    print(f"    false alerts: {false_alerts}/{num_sims} ({100.0 * false_alerts / num_sims:.2f}%)")
+    print(f"    nuisance alert max active time: {nuisance_max_alert_time:.2f} s")
+    print(f"    nuisance alerts: {nuisance_alerts}/{num_sims} ({100.0 * nuisance_alerts / num_sims:.2f}%)")
+
+    print("  NMAC proxy metrics:")
+    print(f"    NMAC distance threshold: {nmac_distance:.1f} ft")
+    print(f"    NMAC proxy events: {nmac_count}/{num_sims} ({100.0 * nmac_count / num_sims:.2f}%)")
+    print(f"    min distance mean: {np.mean(min_dists):.1f} ft")
+    print(f"    min distance median: {np.median(min_dists):.1f} ft")
+
+    print("  Advisory stability and reversals:")
+    print(f"    advisory changes total: {advisory_changes}")
+    print(f"    advisory changes mean per sim: {advisory_changes / num_sims:.3f}")
+    print(f"    sims with at least one reversal: {reversals}/{num_sims} ({100.0 * reversals / num_sims:.2f}%)")
 
 def plot(s, save_mp4):
     """plot a specific simulation"""
@@ -593,8 +743,8 @@ def plot(s, save_mp4):
         if not save_mp4:
             f *= 1 # multiplier to make animation faster
 
-        if (f+1) % 10 == 0:
-            print(f"Frame: {f+1} / {num_frames}")
+        # if (f+1) % 10 == 0:
+        #     print(f"Frame: {f+1} / {num_frames}")
 
         run_index = f // (num_steps + 2 * freeze_frames)
 
@@ -675,6 +825,17 @@ def make_random_input(seed, intruder_can_turn=True, num_inputs=100):
 
     return init_vec, cmd_list, init_velo
 
+def get_initial_advisory(init_vec, v_own, v_int):
+    """compute initial advisory for a candidate initial condition"""
+
+    state5 = state7_to_state5(init_vec, v_own, v_int)
+
+    if state5[0] > 60760:
+        return 0 # rho exceeds network limit
+
+    res = run_network(State.nets[0], state5)
+    return int(np.argmin(res))
+
 def main():
     'main entry point'
 
@@ -683,52 +844,123 @@ def main():
     parser.add_argument("--save-mp4", action='store_true', default=False, help="Save plotted mp4 files to disk.")
     parser.add_argument("--intruder-turn", action='store_true', default=False, help="Toggles boolean flag to allow intruder to perform \
                                                                                      commands other than flying straight.")
-    parser.add_argument("--fixed-seed", type=int, default=None, help="Simulates the parameters generated by provided seed.")
+    parser.add_argument("--seed", type=str, default="min", help="Seed to simulate: use 'min' to search for minimum-distance seed, or provide an integer seed (e.g. 671).")
+    parser.add_argument("--num-sims", type=int, default=1000, help="Number of random seeds to evaluate when --seed=min.")
+    parser.add_argument("--turning-ratio", type=float, default=0.9, help="Target fraction of --seed=min simulations that start with a turning advisory (1-4).")
+    parser.add_argument("--max-sampling-attempts", type=int, default=250000, help="Maximum candidate seeds examined while enforcing the turning/COC start ratio.")
     parser.add_argument("--min-dwell-time", type=float, default=0.0, help="Minimum advisory dwell time in seconds before command changes are allowed.")
+    parser.add_argument("--q-hysteresis-margin", type=float, default=0.0, help="Minimum Q-value improvement required to change advisories.")
+    parser.add_argument("--nmac-distance", type=float, default=500.0, help="Distance threshold in feet for NMAC proxy events.")
+    parser.add_argument("--false-alert-distance", type=float, default=4000.0, help="If an alert occurs but min distance stays above this threshold, count as false alert.")
+    parser.add_argument("--nuisance-max-alert-time", type=float, default=2.0, help="Maximum total alert-active time (s) to classify an alert as nuisance.")
     args = parser.parse_args()
 
     intruder_can_turn = args.intruder_turn
     save_mp4 = args.save_mp4
-    fixed_seed = args.fixed_seed
+    seed_choice = args.seed.strip().lower()
+    num_sims = max(1, args.num_sims)
+    turning_ratio = min(1.0, max(0.0, args.turning_ratio))
+    max_sampling_attempts = max(1, args.max_sampling_attempts)
     State.min_dwell_time = max(0.0, args.min_dwell_time)
+    State.q_hysteresis_margin = max(0.0, args.q_hysteresis_margin)
+    nmac_distance = max(0.0, args.nmac_distance)
+    false_alert_distance = max(0.0, args.false_alert_distance)
+    nuisance_max_alert_time = max(0.0, args.nuisance_max_alert_time)
 
     interesting_seed = -1
     interesting_state = None
 
-    if fixed_seed is not None:
-        interesting_seed = fixed_seed
-    else:
-        num_sims = 100
-        # with 10000 sims, seed 671 has min_dist 4254.5ft
+    if seed_choice == "min":
+        # Build a stratified set of starts: mostly turning-advisory starts with a COC minority.
+        target_turning = int(round(num_sims * turning_ratio))
+        target_coc = num_sims - target_turning
+        turning_cases = []
+        coc_cases = []
+        candidate_seed = 0
+
+        print(f"Selecting starts: target_turning={target_turning}, target_coc={target_coc}")
+
+        while (len(turning_cases) < target_turning or len(coc_cases) < target_coc) and candidate_seed < max_sampling_attempts:
+            init_vec, cmd_list, init_velo = make_random_input(candidate_seed, intruder_can_turn=intruder_can_turn)
+            v_own = init_velo[0]
+            v_int = init_velo[1]
+            command = get_initial_advisory(init_vec, v_own, v_int)
+
+            case = (candidate_seed, init_vec, cmd_list, init_velo)
+
+            if command == 0:
+                if len(coc_cases) < target_coc:
+                    coc_cases.append(case)
+            elif len(turning_cases) < target_turning:
+                turning_cases.append(case)
+
+            candidate_seed += 1
+
+        if len(turning_cases) < target_turning or len(coc_cases) < target_coc:
+            raise RuntimeError(
+                f"Could not satisfy requested start mix within {max_sampling_attempts} attempts. "
+                f"Need turning={target_turning}, coc={target_coc}; got turning={len(turning_cases)}, coc={len(coc_cases)}."
+            )
+
+        selected_cases = turning_cases + coc_cases
+        # Deterministic shuffle so order is mixed but repeatable.
+        np.random.default_rng(0).shuffle(selected_cases)
+
+        print(
+            f"Selected {len(selected_cases)} starts from {candidate_seed} candidates "
+            f"({len(turning_cases)} turning, {len(coc_cases)} COC)"
+        )
 
         start = time.perf_counter()
+        metrics = {
+            'alerts': 0,
+            'first_alert_ranges': [],
+            'alert_lead_times': [],
+            'false_alerts': 0,
+            'nuisance_alerts': 0,
+            'nmac_count': 0,
+            'total_advisory_changes': 0,
+            'reversal_sims': 0,
+            'min_dists': [],
+            'initial_turning_count': len(turning_cases),
+            'initial_coc_count': len(coc_cases),
+        }
 
-        for seed in range(num_sims):
+        for case in selected_cases:
+            seed, init_vec, cmd_list, init_velo = case
             if seed % 1000 == 0:
                 print(f"{(seed//1000) % 10}", end='', flush=True)
             elif seed % 100 == 0:
                 print(".", end='', flush=True)
 
-            init_vec, cmd_list, init_velo = make_random_input(seed, intruder_can_turn=intruder_can_turn)
-
             v_own = init_velo[0]
             v_int = init_velo[1]
-
-            # reject start states where initial command is not clear-of-conflict
-            state5 = state7_to_state5(init_vec, v_own, v_int)
-
-            if state5[0] > 60760:
-                command = 0 # rho exceeds network limit
-            else:
-                res = run_network(State.nets[0], state5)
-                command = np.argmin(res)
-
-            if command != 0:
-                continue
 
             # run the simulation
             s = State(init_vec, v_own, v_int, save_states=False)
             s.simulate(cmd_list)
+            sim_m = s.sim_metrics
+            alerted = sim_m['first_alert_time'] is not None
+
+            if alerted:
+                metrics['alerts'] += 1
+                metrics['first_alert_ranges'].append(sim_m['first_alert_range'])
+                metrics['alert_lead_times'].append(sim_m['alert_lead_time_to_cpa'])
+
+            if alerted and sim_m['min_dist'] > false_alert_distance:
+                metrics['false_alerts'] += 1
+
+            if alerted and sim_m['alert_active_time'] <= nuisance_max_alert_time and sim_m['min_dist'] > nmac_distance:
+                metrics['nuisance_alerts'] += 1
+
+            if sim_m['min_dist'] < nmac_distance:
+                metrics['nmac_count'] += 1
+
+            metrics['total_advisory_changes'] += sim_m['advisory_change_count']
+            metrics['min_dists'].append(sim_m['min_dist'])
+
+            if sim_m['reversal_count'] > 0:
+                metrics['reversal_sims'] += 1
 
             # save most interesting state based on some criteria
             if interesting_state is None or s.min_dist < interesting_state.min_dist:
@@ -736,8 +968,21 @@ def main():
                 interesting_state = s
 
         diff = time.perf_counter() - start
-        ms_per_sim = round(1000 * diff / num_sims, 3)
-        print(f"\nDid {num_sims} sims in {round(diff, 1)} secs ({ms_per_sim}ms per sim)")
+        summarize_performance(
+            metrics=metrics,
+            num_sims=num_sims,
+            total_runtime=diff,
+            false_alert_distance=false_alert_distance,
+            nuisance_max_alert_time=nuisance_max_alert_time,
+            nmac_distance=nmac_distance,
+        )
+    else:
+        try:
+            interesting_seed = int(seed_choice)
+            if interesting_seed < 0:
+                raise ValueError
+        except ValueError:
+            parser.error("--seed must be 'min' or a non-negative integer (e.g. 671).")
 
     # optional: do plot
     assert interesting_seed != -1
@@ -748,6 +993,14 @@ def main():
 
     d = round(s.min_dist, 2)
     print(f"\nSeed {interesting_seed} has min_dist {d}ft")
+    print(
+        f"Seed metrics: first_alert_time={s.sim_metrics['first_alert_time']}, "
+        f"first_alert_range={None if s.sim_metrics['first_alert_range'] is None else round(s.sim_metrics['first_alert_range'], 2)}ft, "
+        f"alert_lead_time_to_cpa={s.sim_metrics['alert_lead_time_to_cpa']}, "
+        f"advisory_changes={s.sim_metrics['advisory_change_count']}, "
+        f"reversals={s.sim_metrics['reversal_count']}, "
+        f"alert_active_time={round(s.sim_metrics['alert_active_time'], 2)}s"
+    )
     plot(s, save_mp4)
 
 if __name__ == "__main__":
