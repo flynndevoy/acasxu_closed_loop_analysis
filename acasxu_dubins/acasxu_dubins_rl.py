@@ -1,7 +1,8 @@
 '''
-ACASXu neural networks closed loop simulation with dubin's car dynamics
+Closed-loop simulation with dubins car dynamics using a trained RL ONNX policy.
 
-Used for falsification, where the opponent is allowed to maneuver over time
+This is a duplicate of acasxu_dubins.py adapted to use one learned policy network
+from tools/train_dubins_rl.py (6D input, argmax action selection).
 '''
 
 from functools import lru_cache
@@ -26,6 +27,9 @@ from matplotlib.lines import Line2D
 
 import onnxruntime as ort
 from numba import njit
+
+RHO_MAX = 60760.0
+V_MAX = 1200.0
 
 def init_plot():
     'initialize plotting style'
@@ -113,6 +117,38 @@ def run_network(network_tuple, x, stdout=False):
     in_array.shape = (1, 1, 1, 5)
     outputs = session.run(None, {'input': in_array})
 
+    return outputs[0][0]
+
+def load_rl_policy(onnx_path):
+    """Load single RL policy ONNX session."""
+
+    session = ort.InferenceSession(onnx_path)
+
+    # warm up
+    i = np.zeros((1, 6), dtype=np.float32)
+    session.run(None, {'input': i})
+    return session
+
+def run_rl_policy(session, state5, last_cmd, stdout=False):
+    """Run RL policy. Input is normalized 6D: [rho,theta,psi,v_own,v_int,last_cmd]."""
+
+    rho, theta, psi, v_own, v_int = [float(v) for v in state5]
+    x = np.array(
+        [
+            min(max(rho / RHO_MAX, 0.0), 2.0),
+            theta / np.pi,
+            psi / np.pi,
+            v_own / V_MAX,
+            v_int / V_MAX,
+            float(last_cmd) / 4.0,
+        ],
+        dtype=np.float32,
+    ).reshape((1, 6))
+
+    if stdout:
+        print(f"rl input (normalized): {x}")
+
+    outputs = session.run(None, {'input': x})
     return outputs[0][0]
 
 @njit(cache=True)
@@ -326,7 +362,7 @@ class MeasurementHealth:
 class State():
     'state of execution container'
 
-    nets = load_networks()
+    rl_session = None
     plane_size = 1500
 
     nn_update_rate = 1.0 # todo: make this a parameter
@@ -835,27 +871,23 @@ class State():
             reversal_ok = True
         else:
             last_command = self.command
-
-            net = State.nets[last_command]
-
             state = [rho, theta, psi, v_own, v_int]
-
-            res = run_network(net, state)
+            res = run_rl_policy(State.rl_session, state, last_command)
             adjusted_res = np.array(res, copy=True)
 
             current_dir = State.get_advisory_direction(self.command)
             if State.continuity_bias > 0.0 and current_dir != 0:
                 for cmd_index in range(5):
                     if State.get_advisory_direction(cmd_index) == -current_dir:
-                        adjusted_res[cmd_index] += State.continuity_bias
+                        adjusted_res[cmd_index] -= State.continuity_bias
 
-            new_command = int(np.argmin(adjusted_res))
+            new_command = int(np.argmax(adjusted_res))
 
             hysteresis_ok = True
             if new_command != self.command and State.q_hysteresis_margin > 0.0:
                 proposed_q = float(adjusted_res[new_command])
                 current_q = float(adjusted_res[self.command])
-                hysteresis_ok = (current_q - proposed_q) >= State.q_hysteresis_margin
+                hysteresis_ok = (proposed_q - current_q) >= State.q_hysteresis_margin
 
             reversal_ok = True
             old_dir = State.get_advisory_direction(self.command)
@@ -874,7 +906,7 @@ class State():
                 elif State.direct_reversal_margin > 0.0:
                     proposed_q = float(adjusted_res[new_command])
                     current_q = float(adjusted_res[self.command])
-                    reversal_ok = (current_q - proposed_q) >= State.direct_reversal_margin
+                    reversal_ok = (proposed_q - current_q) >= State.direct_reversal_margin
 
                 if not reversal_ok:
                     self.blocked_direct_reversal_count += 1
@@ -921,8 +953,8 @@ class State():
 
         return 0
 
-def summarize_performance(metrics, num_sims, total_runtime, false_alert_distance, nuisance_max_alert_time, nmac_distance):
-    """print aggregate metrics for a sweep of simulations"""
+def get_performance_stats(metrics, num_sims, total_runtime, false_alert_distance, nuisance_max_alert_time, nmac_distance, well_clear_distance):
+    """Compute aggregate metrics for a sweep of simulations."""
 
     alerts = metrics['alerts']
     first_alert_ranges = np.array(metrics['first_alert_ranges'], dtype=float)
@@ -931,6 +963,7 @@ def summarize_performance(metrics, num_sims, total_runtime, false_alert_distance
     false_alerts = metrics['false_alerts']
     nuisance_alerts = metrics['nuisance_alerts']
     nmac_count = metrics['nmac_count']
+    wcv_count = metrics['wcv_count']
     reversals = metrics['reversal_sims']
     advisory_changes = metrics['total_advisory_changes']
     proposed_direct_reversals = metrics['proposed_direct_reversal_total']
@@ -940,72 +973,60 @@ def summarize_performance(metrics, num_sims, total_runtime, false_alert_distance
     sims_per_sec = num_sims / total_runtime if total_runtime > 0 else np.inf
     ms_per_sim = 1000.0 * total_runtime / num_sims if num_sims > 0 else np.inf
 
-    print("\nPerformance metrics summary")
-    print(f"  simulations: {num_sims}")
+    stats = {
+        'alerts': int(alerts),
+        'first_alert_ranges': first_alert_ranges,
+        'lead_times': lead_times,
+        'min_dists': min_dists,
+        'false_alerts': int(false_alerts),
+        'nuisance_alerts': int(nuisance_alerts),
+        'nmac_count': int(nmac_count),
+        'wcv_count': int(wcv_count),
+        'reversals': int(reversals),
+        'advisory_changes': int(advisory_changes),
+        'proposed_direct_reversals': int(proposed_direct_reversals),
+        'blocked_direct_reversals': int(blocked_direct_reversals),
+        'measurement_fault_steps_total': int(measurement_fault_steps_total),
+        'sims_per_sec': float(sims_per_sec),
+        'ms_per_sim': float(ms_per_sim),
+        'false_alert_distance': float(false_alert_distance),
+        'nuisance_max_alert_time': float(nuisance_max_alert_time),
+        'nmac_distance': float(nmac_distance),
+        'well_clear_distance': float(well_clear_distance),
+    }
     if 'initial_turning_count' in metrics and 'initial_coc_count' in metrics:
-        turning_count = metrics['initial_turning_count']
-        coc_count = metrics['initial_coc_count']
-        print(
-            f"  initial advisory mix: turning={turning_count}/{num_sims} ({100.0 * turning_count / num_sims:.1f}%), "
-            f"COC={coc_count}/{num_sims} ({100.0 * coc_count / num_sims:.1f}%)"
-        )
-    print(f"  runtime: {total_runtime:.3f}s total ({ms_per_sim:.3f} ms/sim, {sims_per_sec:.1f} sim/s)")
+        stats['initial_turning_count'] = int(metrics['initial_turning_count'])
+        stats['initial_coc_count'] = int(metrics['initial_coc_count'])
+    return stats
 
-    print("  Detection and alerting range:")
-    if alerts > 0:
-        print(f"    alert rate: {alerts}/{num_sims} ({100.0 * alerts / num_sims:.2f}%)")
-        print(f"    first alert range mean: {np.mean(first_alert_ranges):.1f} ft")
-        print(f"    first alert range median: {np.median(first_alert_ranges):.1f} ft")
-    else:
-        print("    no alerts issued")
-
-    print("  Alert timing relative to closest point of approach:")
-    if lead_times.size > 0:
-        print(f"    lead time mean (CPA - first alert): {np.mean(lead_times):.2f} s")
-        print(f"    lead time median (CPA - first alert): {np.median(lead_times):.2f} s")
-        late_count = int(np.sum(lead_times < 0))
-        print(f"    late alerts (after CPA): {late_count}/{lead_times.size}")
-    else:
-        print("    no alert timing samples")
-
-    print("  False alert and nuisance alert rate:")
-    print(f"    false alert distance threshold: {false_alert_distance:.1f} ft")
-    print(f"    false alerts: {false_alerts}/{num_sims} ({100.0 * false_alerts / num_sims:.2f}%)")
-    print(f"    nuisance alert max active time: {nuisance_max_alert_time:.2f} s")
-    print(f"    nuisance alerts: {nuisance_alerts}/{num_sims} ({100.0 * nuisance_alerts / num_sims:.2f}%)")
-
-    print("  NMAC proxy metrics:")
-    print(f"    NMAC distance threshold: {nmac_distance:.1f} ft")
-    print(f"    NMAC proxy events: {nmac_count}/{num_sims} ({100.0 * nmac_count / num_sims:.2f}%)")
-    print(f"    min distance mean: {np.mean(min_dists):.1f} ft")
-    print(f"    min distance median: {np.median(min_dists):.1f} ft")
-
-    print("  Advisory stability and reversals:")
-    print(f"    advisory changes total: {advisory_changes}")
-    print(f"    advisory changes mean per sim: {advisory_changes / num_sims:.3f}")
-    print(f"    sims with at least one reversal: {reversals}/{num_sims} ({100.0 * reversals / num_sims:.2f}%)")
-    print(f"    proposed direct reversals: {proposed_direct_reversals}")
-    print(f"    blocked direct reversals: {blocked_direct_reversals}")
-    print(f"    measurement fault-gated steps: {measurement_fault_steps_total}")
-
-def build_performance_summary(metrics, num_sims, total_runtime, false_alert_distance, nuisance_max_alert_time, nmac_distance):
+def build_performance_summary(metrics, num_sims, total_runtime, false_alert_distance, nuisance_max_alert_time, nmac_distance, well_clear_distance):
     """Build aggregate metrics as a serializable dict."""
 
-    alerts = metrics['alerts']
-    first_alert_ranges = np.array(metrics['first_alert_ranges'], dtype=float)
-    lead_times = np.array(metrics['alert_lead_times'], dtype=float)
-    min_dists = np.array(metrics['min_dists'], dtype=float)
-    false_alerts = metrics['false_alerts']
-    nuisance_alerts = metrics['nuisance_alerts']
-    nmac_count = metrics['nmac_count']
-    reversals = metrics['reversal_sims']
-    advisory_changes = metrics['total_advisory_changes']
+    stats = get_performance_stats(
+        metrics=metrics,
+        num_sims=num_sims,
+        total_runtime=total_runtime,
+        false_alert_distance=false_alert_distance,
+        nuisance_max_alert_time=nuisance_max_alert_time,
+        nmac_distance=nmac_distance,
+        well_clear_distance=well_clear_distance,
+    )
+    alerts = stats['alerts']
+    first_alert_ranges = stats['first_alert_ranges']
+    lead_times = stats['lead_times']
+    min_dists = stats['min_dists']
+    false_alerts = stats['false_alerts']
+    nuisance_alerts = stats['nuisance_alerts']
+    nmac_count = stats['nmac_count']
+    reversals = stats['reversals']
+    advisory_changes = stats['advisory_changes']
 
     summary = {
+        '_stats': stats,
         'simulations': int(num_sims),
         'runtime_seconds': float(total_runtime),
-        'ms_per_sim': float(1000.0 * total_runtime / num_sims) if num_sims > 0 else float('inf'),
-        'sims_per_sec': float(num_sims / total_runtime) if total_runtime > 0 else float('inf'),
+        'ms_per_sim': stats['ms_per_sim'],
+        'sims_per_sec': stats['sims_per_sec'],
         'alerts': int(alerts),
         'alert_rate_percent': float(100.0 * alerts / num_sims) if num_sims > 0 else 0.0,
         'false_alert_distance': float(false_alert_distance),
@@ -1014,6 +1035,9 @@ def build_performance_summary(metrics, num_sims, total_runtime, false_alert_dist
         'nuisance_max_alert_time': float(nuisance_max_alert_time),
         'nuisance_alerts': int(nuisance_alerts),
         'nuisance_alert_rate_percent': float(100.0 * nuisance_alerts / num_sims) if num_sims > 0 else 0.0,
+        'well_clear_distance': float(well_clear_distance),
+        'wcv_count': int(stats['wcv_count']),
+        'wcv_rate_percent': float(100.0 * stats['wcv_count'] / num_sims) if num_sims > 0 else 0.0,
         'nmac_distance': float(nmac_distance),
         'nmac_count': int(nmac_count),
         'nmac_rate_percent': float(100.0 * nmac_count / num_sims) if num_sims > 0 else 0.0,
@@ -1023,14 +1047,14 @@ def build_performance_summary(metrics, num_sims, total_runtime, false_alert_dist
         'advisory_changes_mean_per_sim': float(advisory_changes / num_sims) if num_sims > 0 else 0.0,
         'reversal_sims': int(reversals),
         'reversal_sim_rate_percent': float(100.0 * reversals / num_sims) if num_sims > 0 else 0.0,
-        'proposed_direct_reversals': int(metrics['proposed_direct_reversal_total']),
-        'blocked_direct_reversals': int(metrics['blocked_direct_reversal_total']),
-        'measurement_fault_steps_total': int(metrics['measurement_fault_steps_total']),
+        'proposed_direct_reversals': stats['proposed_direct_reversals'],
+        'blocked_direct_reversals': stats['blocked_direct_reversals'],
+        'measurement_fault_steps_total': stats['measurement_fault_steps_total'],
     }
 
-    if 'initial_turning_count' in metrics and 'initial_coc_count' in metrics:
-        summary['initial_turning_count'] = int(metrics['initial_turning_count'])
-        summary['initial_coc_count'] = int(metrics['initial_coc_count'])
+    if 'initial_turning_count' in stats and 'initial_coc_count' in stats:
+        summary['initial_turning_count'] = stats['initial_turning_count']
+        summary['initial_coc_count'] = stats['initial_coc_count']
 
     if alerts > 0:
         summary['first_alert_range_mean'] = float(np.mean(first_alert_ranges))
@@ -1042,6 +1066,57 @@ def build_performance_summary(metrics, num_sims, total_runtime, false_alert_dist
         summary['late_alert_count'] = int(np.sum(lead_times < 0))
 
     return summary
+
+def format_terminal_style_summary(stats, num_sims, total_runtime):
+    """Format results in the same order/style as the former terminal summary."""
+
+    lines = [
+        "Performance metrics summary",
+        f"  simulations: {num_sims}",
+    ]
+    if 'initial_turning_count' in stats and 'initial_coc_count' in stats:
+        turning_count = stats['initial_turning_count']
+        coc_count = stats['initial_coc_count']
+        lines.append(
+            f"  initial advisory mix: turning={turning_count}/{num_sims} ({100.0 * turning_count / num_sims:.1f}%), "
+            f"COC={coc_count}/{num_sims} ({100.0 * coc_count / num_sims:.1f}%)"
+        )
+    lines.append(f"  runtime: {total_runtime:.3f}s total ({stats['ms_per_sim']:.3f} ms/sim, {stats['sims_per_sec']:.1f} sim/s)")
+    lines.append("  Detection and alerting range:")
+    if stats['alerts'] > 0:
+        lines.append(f"    alert rate: {stats['alerts']}/{num_sims} ({100.0 * stats['alerts'] / num_sims:.2f}%)")
+        lines.append(f"    first alert range mean: {np.mean(stats['first_alert_ranges']):.1f} ft")
+        lines.append(f"    first alert range median: {np.median(stats['first_alert_ranges']):.1f} ft")
+    else:
+        lines.append("    no alerts issued")
+    lines.append("  Alert timing relative to closest point of approach:")
+    if stats['lead_times'].size > 0:
+        lines.append(f"    lead time mean (CPA - first alert): {np.mean(stats['lead_times']):.2f} s")
+        lines.append(f"    lead time median (CPA - first alert): {np.median(stats['lead_times']):.2f} s")
+        lines.append(f"    late alerts (after CPA): {int(np.sum(stats['lead_times'] < 0))}/{stats['lead_times'].size}")
+    else:
+        lines.append("    no alert timing samples")
+    lines.append("  False alert and nuisance alert rate:")
+    lines.append(f"    false alert distance threshold: {stats['false_alert_distance']:.1f} ft")
+    lines.append(f"    false alerts: {stats['false_alerts']}/{num_sims} ({100.0 * stats['false_alerts'] / num_sims:.2f}%)")
+    lines.append(f"    nuisance alert max active time: {stats['nuisance_max_alert_time']:.2f} s")
+    lines.append(f"    nuisance alerts: {stats['nuisance_alerts']}/{num_sims} ({100.0 * stats['nuisance_alerts'] / num_sims:.2f}%)")
+    lines.append("  Well-clear metrics:")
+    lines.append(f"    well-clear distance threshold: {stats['well_clear_distance']:.1f} ft")
+    lines.append(f"    well-clear violations: {stats['wcv_count']}/{num_sims} ({100.0 * stats['wcv_count'] / num_sims:.2f}%)")
+    lines.append("  NMAC proxy metrics:")
+    lines.append(f"    NMAC distance threshold: {stats['nmac_distance']:.1f} ft")
+    lines.append(f"    NMAC proxy events: {stats['nmac_count']}/{num_sims} ({100.0 * stats['nmac_count'] / num_sims:.2f}%)")
+    lines.append(f"    min distance mean: {np.mean(stats['min_dists']):.1f} ft")
+    lines.append(f"    min distance median: {np.median(stats['min_dists']):.1f} ft")
+    lines.append("  Advisory stability and reversals:")
+    lines.append(f"    advisory changes total: {stats['advisory_changes']}")
+    lines.append(f"    advisory changes mean per sim: {stats['advisory_changes'] / num_sims:.3f}")
+    lines.append(f"    sims with at least one reversal: {stats['reversals']}/{num_sims} ({100.0 * stats['reversals'] / num_sims:.2f}%)")
+    lines.append(f"    proposed direct reversals: {stats['proposed_direct_reversals']}")
+    lines.append(f"    blocked direct reversals: {stats['blocked_direct_reversals']}")
+    lines.append(f"    measurement fault-gated steps: {stats['measurement_fault_steps_total']}")
+    return lines
 
 def write_run_report(script_name, args, aggregate_summary, interesting_seed, interesting_state, report_dir="results"):
     """Write a timestamped markdown report for this run."""
@@ -1067,10 +1142,21 @@ def write_run_report(script_name, args, aggregate_summary, interesting_seed, int
     if aggregate_summary is not None:
         lines += [
             "",
+            "## Results",
+            "",
+        ]
+        terminal_lines = format_terminal_style_summary(
+            stats=aggregate_summary['_stats'],
+            num_sims=aggregate_summary['simulations'],
+            total_runtime=aggregate_summary['runtime_seconds'],
+        )
+        lines.extend([f"- {line}" for line in terminal_lines])
+        lines += [
+            "",
             "## Aggregate Results",
             "",
         ]
-        for key in sorted(aggregate_summary):
+        for key in sorted(k for k in aggregate_summary if k != '_stats'):
             lines.append(f"- `{key}`: `{aggregate_summary[key]}`")
 
     if interesting_state is not None:
@@ -1086,6 +1172,8 @@ def write_run_report(script_name, args, aggregate_summary, interesting_seed, int
             "",
             "## Selected Seed Metrics",
             "",
+            "- Seed metrics summary",
+            "",
         ]
         for key in sorted(sim_metrics):
             lines.append(f"- `{key}`: `{sim_metrics[key]}`")
@@ -1093,7 +1181,6 @@ def write_run_report(script_name, args, aggregate_summary, interesting_seed, int
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-    print(f"Saved run report to {report_path}")
     return report_path
 
 def plot(s, save_mp4):
@@ -1228,21 +1315,22 @@ def make_random_input(seed, intruder_can_turn=True, num_inputs=100):
     return init_vec, cmd_list, init_velo
 
 def get_initial_advisory(init_vec, v_own, v_int):
-    """compute initial advisory for a candidate initial condition"""
+    """compute RL initial advisory for a candidate initial condition"""
 
     state5 = state7_to_state5(init_vec, v_own, v_int)
 
     if state5[0] > 60760:
         return 0 # rho exceeds network limit
 
-    res = run_network(State.nets[0], state5)
-    return int(np.argmin(res))
+    res = run_rl_policy(State.rl_session, state5, last_cmd=0)
+    return int(np.argmax(res))
 
 def main():
     'main entry point'
 
     # parse arguments
-    parser = argparse.ArgumentParser(description='Run ACASXU Dublins model simulator.')
+    parser = argparse.ArgumentParser(description='Run Dubins simulator with trained RL ONNX policy.')
+    parser.add_argument("--rl-model-path", type=str, default="trained_rl/dqn_best.onnx", help="Path to trained RL ONNX policy.")
     parser.add_argument("--save-mp4", action='store_true', default=False, help="Save plotted mp4 files to disk.")
     parser.add_argument("--intruder-turn", action='store_true', default=False, help="Toggles boolean flag to allow intruder to perform \
                                                                                      commands other than flying straight.")
@@ -1267,10 +1355,13 @@ def main():
     parser.add_argument("--camera-bad-frames-trip", type=int, default=3, help="Consecutive bad health evaluations required to activate measurement fault.")
     parser.add_argument("--camera-good-frames-clear", type=int, default=5, help="Consecutive good health evaluations required to clear measurement fault.")
     parser.add_argument("--camera-rng-seed", type=int, default=0, help="RNG seed used for camera dropout/noise simulation.")
+    parser.add_argument("--well-clear-distance", type=float, default=2200.0, help="Distance threshold in feet for well-clear violation events.")
     parser.add_argument("--nmac-distance", type=float, default=500.0, help="Distance threshold in feet for NMAC proxy events.")
     parser.add_argument("--false-alert-distance", type=float, default=4000.0, help="If an alert occurs but min distance stays above this threshold, count as false alert.")
     parser.add_argument("--nuisance-max-alert-time", type=float, default=2.0, help="Maximum total alert-active time (s) to classify an alert as nuisance.")
     args = parser.parse_args()
+
+    State.rl_session = load_rl_policy(args.rl_model_path)
 
     intruder_can_turn = args.intruder_turn
     save_mp4 = args.save_mp4
@@ -1295,6 +1386,7 @@ def main():
     State.camera_bad_frames_trip = max(1, args.camera_bad_frames_trip)
     State.camera_good_frames_clear = max(1, args.camera_good_frames_clear)
     State.camera_rng_seed = args.camera_rng_seed
+    well_clear_distance = max(0.0, args.well_clear_distance)
     nmac_distance = max(0.0, args.nmac_distance)
     false_alert_distance = max(0.0, args.false_alert_distance)
     nuisance_max_alert_time = max(0.0, args.nuisance_max_alert_time)
@@ -1351,6 +1443,7 @@ def main():
             'alert_lead_times': [],
             'false_alerts': 0,
             'nuisance_alerts': 0,
+            'wcv_count': 0,
             'nmac_count': 0,
             'total_advisory_changes': 0,
             'reversal_sims': 0,
@@ -1389,6 +1482,9 @@ def main():
             if alerted and sim_m['alert_active_time'] <= nuisance_max_alert_time and sim_m['min_dist'] > nmac_distance:
                 metrics['nuisance_alerts'] += 1
 
+            if sim_m['min_dist'] < well_clear_distance:
+                metrics['wcv_count'] += 1
+
             if sim_m['min_dist'] < nmac_distance:
                 metrics['nmac_count'] += 1
 
@@ -1414,14 +1510,7 @@ def main():
             false_alert_distance=false_alert_distance,
             nuisance_max_alert_time=nuisance_max_alert_time,
             nmac_distance=nmac_distance,
-        )
-        summarize_performance(
-            metrics=metrics,
-            num_sims=num_sims,
-            total_runtime=diff,
-            false_alert_distance=false_alert_distance,
-            nuisance_max_alert_time=nuisance_max_alert_time,
-            nmac_distance=nmac_distance,
+            well_clear_distance=well_clear_distance,
         )
     else:
         try:
@@ -1439,25 +1528,14 @@ def main():
     s.simulate(cmd_list)
 
     d = round(s.min_dist, 2)
-    print(f"\nSeed {interesting_seed} has min_dist {d}ft")
-    print(
-        f"Seed metrics: first_alert_time={s.sim_metrics['first_alert_time']}, "
-        f"first_alert_range={None if s.sim_metrics['first_alert_range'] is None else round(s.sim_metrics['first_alert_range'], 2)}ft, "
-        f"alert_lead_time_to_cpa={s.sim_metrics['alert_lead_time_to_cpa']}, "
-        f"advisory_changes={s.sim_metrics['advisory_change_count']}, "
-        f"reversals={s.sim_metrics['reversal_count']}, "
-        f"proposed_direct_reversals={s.sim_metrics['proposed_direct_reversal_count']}, "
-        f"blocked_direct_reversals={s.sim_metrics['blocked_direct_reversal_count']}, "
-        f"measurement_fault_steps={s.sim_metrics['measurement_fault_steps']}, "
-        f"alert_active_time={round(s.sim_metrics['alert_active_time'], 2)}s"
-    )
-    write_run_report(
-        script_name="acasxu_dubins",
+    report_path = write_run_report(
+        script_name="acasxu_dubins_rl",
         args=args,
         aggregate_summary=aggregate_summary,
         interesting_seed=interesting_seed,
         interesting_state=s,
     )
+    print(f"Saved run report to {report_path}")
     plot(s, save_mp4)
 
 if __name__ == "__main__":

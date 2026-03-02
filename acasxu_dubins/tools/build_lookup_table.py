@@ -11,6 +11,7 @@ import time
 import numpy as np
 import onnxruntime as ort
 
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 
 MEANS_FOR_SCALING = np.array(
     [19791.091, 0.0, 0.0, 650.0, 600.0],
@@ -44,9 +45,8 @@ ADVISORY_NAMES = [
 def get_onnx_path(last_command):
     """Get network filename path for a given previous advisory."""
 
-    dirname = os.path.dirname(__file__)
     name = f"ACASXU_run2a_{last_command + 1}_1_batch_2000.onnx"
-    return os.path.join(dirname, name)
+    return os.path.join(BASE_DIR, name)
 
 
 def load_sessions():
